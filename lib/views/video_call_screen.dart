@@ -1,4 +1,3 @@
-
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -23,12 +22,12 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
   MediaStream? _localStream;
-
+  
   bool _isConnecting = true;
   bool _isConnected = false;
   bool _isMuted = false;
   bool _isVideoOff = false;
-
+  
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   String? _actualRoomId;
   StreamSubscription? _roomSubscription;
@@ -53,8 +52,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     await _createPeerConnection();
 
     if (widget.isHost) {
+      // Doctor creates the room
       await _createRoom();
     } else {
+      // Patient joins the room
       await _joinRoom();
     }
   }
@@ -73,8 +74,18 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
       _localRenderer.srcObject = _localStream;
       setState(() {});
+      
+      print('✅ Local media stream obtained');
     } catch (e) {
-      print('Error getting user media: $e');
+      print('❌ Error getting user media: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Camera/Microphone permission denied: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
@@ -87,40 +98,59 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     _peerConnection = await createPeerConnection(configuration);
 
-    // Add tracks using addStream instead of addTrack
+    // Add local stream using addStream (simpler than addTrack)
     if (_localStream != null) {
       await _peerConnection!.addStream(_localStream!);
+      print('✅ Local stream added to peer connection');
     }
 
+    // Listen for remote stream
     _peerConnection?.onTrack = (RTCTrackEvent event) {
+      print('🎥 Received remote track: ${event.track.kind}');
       if (event.streams.isNotEmpty) {
         _remoteRenderer.srcObject = event.streams[0];
         setState(() {
           _isConnected = true;
           _isConnecting = false;
         });
+        print('✅ Remote stream connected!');
       }
     };
 
+    // Listen for ICE candidates
     _peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
+      print('🧊 ICE candidate: ${candidate.candidate}');
       _addIceCandidate(candidate);
     };
 
+    // Connection state changes
     _peerConnection?.onConnectionState = (RTCPeerConnectionState state) {
-      print('Connection state: $state');
+      print('🔗 Connection state: $state');
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
         setState(() {
           _isConnected = true;
           _isConnecting = false;
         });
+      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+                 state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        setState(() {
+          _isConnecting = false;
+        });
       }
     };
+
+    print('✅ Peer connection created');
   }
 
   Future<void> _createRoom() async {
+    _actualRoomId = widget.roomId;
+    print('🏠 Creating room: $_actualRoomId (Doctor is host)');
+
+    // Create offer
     RTCSessionDescription offer = await _peerConnection!.createOffer();
     await _peerConnection!.setLocalDescription(offer);
 
+    // Save offer to Firestore
     Map<String, dynamic> roomData = {
       'offer': {
         'type': offer.type,
@@ -129,25 +159,33 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
       'createdAt': FieldValue.serverTimestamp(),
     };
 
-    DocumentReference roomRef = await _firestore.collection('video_rooms').add(roomData);
-    _actualRoomId = roomRef.id;
+    await _firestore.collection('video_rooms').doc(_actualRoomId).set(roomData);
+    print('✅ Room created with offer');
 
-    print('Room created: $_actualRoomId');
-
-    _roomSubscription = roomRef.snapshots().listen((snapshot) async {
+    // Listen for answer from patient
+    _roomSubscription = _firestore
+        .collection('video_rooms')
+        .doc(_actualRoomId)
+        .snapshots()
+        .listen((snapshot) async {
       if (snapshot.exists) {
-        Map<String, dynamic>? data = snapshot.data() as Map<String, dynamic>?;
+        Map<String, dynamic>? data = snapshot.data();
         if (data != null && data.containsKey('answer')) {
+          print('📥 Received answer from patient');
           RTCSessionDescription answer = RTCSessionDescription(
             data['answer']['sdp'],
             data['answer']['type'],
           );
           await _peerConnection!.setRemoteDescription(answer);
+          print('✅ Answer set as remote description');
         }
       }
     });
 
-    _candidatesSubscription = roomRef
+    // Listen for ICE candidates from patient
+    _candidatesSubscription = _firestore
+        .collection('video_rooms')
+        .doc(_actualRoomId)
         .collection('participants')
         .snapshots()
         .listen((snapshot) {
@@ -155,6 +193,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         if (change.type == DocumentChangeType.added) {
           Map<String, dynamic> data = change.doc.data()!;
           if (data.containsKey('candidate')) {
+            print('🧊 Adding patient ICE candidate');
             _peerConnection!.addCandidate(RTCIceCandidate(
               data['candidate'],
               data['sdpMid'],
@@ -167,39 +206,64 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _joinRoom() async {
-    if (widget.roomId == null) {
-      print('No room ID provided');
-      return;
-    }
-
     _actualRoomId = widget.roomId;
-    DocumentReference roomRef = _firestore.collection('video_rooms').doc(_actualRoomId);
-    DocumentSnapshot roomSnapshot = await roomRef.get();
+    print('🚪 Joining room: $_actualRoomId (Patient joining)');
 
-    if (!roomSnapshot.exists) {
-      print('Room does not exist');
-      return;
+    DocumentReference roomRef = _firestore.collection('video_rooms').doc(_actualRoomId);
+    
+    // Wait for offer from doctor
+    int attempts = 0;
+    while (attempts < 30) { // Wait up to 30 seconds
+      DocumentSnapshot roomSnapshot = await roomRef.get();
+      
+      if (roomSnapshot.exists) {
+        Map<String, dynamic>? data = roomSnapshot.data() as Map<String, dynamic>?;
+        if (data != null && data.containsKey('offer')) {
+          print('📥 Received offer from doctor');
+          
+          // Set remote description (offer)
+          RTCSessionDescription offer = RTCSessionDescription(
+            data['offer']['sdp'],
+            data['offer']['type'],
+          );
+          await _peerConnection!.setRemoteDescription(offer);
+          
+          // Create answer
+          RTCSessionDescription answer = await _peerConnection!.createAnswer();
+          await _peerConnection!.setLocalDescription(answer);
+          
+          // Save answer to Firestore
+          await roomRef.update({
+            'answer': {
+              'type': answer.type,
+              'sdp': answer.sdp,
+            },
+          });
+          print('✅ Answer created and saved');
+          break;
+        }
+      }
+      
+      await Future.delayed(const Duration(seconds: 1));
+      attempts++;
     }
 
-    Map<String, dynamic> data = roomSnapshot.data() as Map<String, dynamic>;
-    RTCSessionDescription offer = RTCSessionDescription(
-      data['offer']['sdp'],
-      data['offer']['type'],
-    );
+    if (attempts >= 30) {
+      print('❌ Timeout waiting for doctor');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Doctor has not started the call yet'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+    }
 
-    await _peerConnection!.setRemoteDescription(offer);
-
-    RTCSessionDescription answer = await _peerConnection!.createAnswer();
-    await _peerConnection!.setLocalDescription(answer);
-
-    await roomRef.update({
-      'answer': {
-        'type': answer.type,
-        'sdp': answer.sdp,
-      },
-    });
-
-    _candidatesSubscription = roomRef
+    // Listen for ICE candidates from doctor
+    _candidatesSubscription = _firestore
+        .collection('video_rooms')
+        .doc(_actualRoomId)
         .collection('host')
         .snapshots()
         .listen((snapshot) {
@@ -207,6 +271,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         if (change.type == DocumentChangeType.added) {
           Map<String, dynamic> data = change.doc.data()!;
           if (data.containsKey('candidate')) {
+            print('🧊 Adding doctor ICE candidate');
             _peerConnection!.addCandidate(RTCIceCandidate(
               data['candidate'],
               data['sdpMid'],
@@ -223,7 +288,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
 
     DocumentReference roomRef = _firestore.collection('video_rooms').doc(_actualRoomId);
     String collection = widget.isHost ? 'host' : 'participants';
-
+    
     await roomRef.collection(collection).add({
       'candidate': candidate.candidate,
       'sdpMid': candidate.sdpMid,
@@ -232,32 +297,37 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   void _toggleMute() {
-    if (_localStream != null) {
-      // Use enable audio track method
-      _localStream!.getAudioTracks()[0].enabled = !_isMuted;
+    if (_localStream != null && _localStream!.getAudioTracks().isNotEmpty) {
+      final audioTrack = _localStream!.getAudioTracks()[0];
+      audioTrack.enabled = !_isMuted;
       setState(() {
         _isMuted = !_isMuted;
       });
+      print('🔇 Audio ${_isMuted ? 'muted' : 'unmuted'}');
     }
   }
 
   void _toggleVideo() {
-    if (_localStream != null) {
-      // Use enable video track method
-      _localStream!.getVideoTracks()[0].enabled = !_isVideoOff;
+    if (_localStream != null && _localStream!.getVideoTracks().isNotEmpty) {
+      final videoTrack = _localStream!.getVideoTracks()[0];
+      videoTrack.enabled = !_isVideoOff;
       setState(() {
         _isVideoOff = !_isVideoOff;
       });
+      print('📹 Video ${_isVideoOff ? 'off' : 'on'}');
     }
   }
 
   Future<void> _switchCamera() async {
     if (_localStream != null && _localStream!.getVideoTracks().isNotEmpty) {
-      await Helper.switchCamera(_localStream!.getVideoTracks()[0]);
+      final videoTrack = _localStream!.getVideoTracks()[0];
+      await Helper.switchCamera(videoTrack);
+      print('🔄 Camera switched');
     }
   }
 
   Future<void> _endCall() async {
+    print('📞 Ending call...');
     await _cleanup();
     if (mounted) {
       Navigator.pop(context);
@@ -265,25 +335,31 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   }
 
   Future<void> _cleanup() async {
-    // Stop all tracks
+    // Stop tracks
     if (_localStream != null) {
-      _localStream!.getAudioTracks()[0].stop();
-      _localStream!.getVideoTracks()[0].stop();
+      if (_localStream!.getAudioTracks().isNotEmpty) {
+        _localStream!.getAudioTracks()[0].stop();
+      }
+      if (_localStream!.getVideoTracks().isNotEmpty) {
+        _localStream!.getVideoTracks()[0].stop();
+      }
       await _localStream!.dispose();
     }
-
+    
     await _peerConnection?.close();
     await _localRenderer.dispose();
     await _remoteRenderer.dispose();
-
+    
     await _roomSubscription?.cancel();
     await _candidatesSubscription?.cancel();
 
+    // Only doctor (host) deletes the room
     if (widget.isHost && _actualRoomId != null) {
       try {
         await _firestore.collection('video_rooms').doc(_actualRoomId).delete();
+        print('✅ Room deleted');
       } catch (e) {
-        print('Error deleting room: $e');
+        print('⚠️ Error deleting room: $e');
       }
     }
   }
@@ -297,27 +373,27 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           children: [
             // Remote video (full screen)
             _isConnected
-                ? RTCVideoView(_remoteRenderer, mirror: false)
+                ? RTCVideoView(_remoteRenderer, mirror: false, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
                 : Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const CircularProgressIndicator(color: Colors.white),
-                  const SizedBox(height: 20),
-                  Text(
-                    _isConnecting ? 'Connecting...' : 'Waiting for participant...',
-                    style: const TextStyle(color: Colors.white, fontSize: 16),
-                  ),
-                  if (widget.isHost) ...[
-                    const SizedBox(height: 20),
-                    Text(
-                      'Room ID: $_actualRoomId',
-                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const CircularProgressIndicator(color: Colors.white),
+                        const SizedBox(height: 20),
+                        Text(
+                          widget.isHost 
+                              ? 'Waiting for patient to join...' 
+                              : 'Connecting to doctor...',
+                          style: const TextStyle(color: Colors.white, fontSize: 16),
+                        ),
+                        const SizedBox(height: 20),
+                        Text(
+                          'Room: $_actualRoomId',
+                          style: const TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
+                      ],
                     ),
-                  ],
-                ],
-              ),
-            ),
+                  ),
 
             // Local video (small overlay)
             Positioned(
@@ -334,15 +410,40 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   borderRadius: BorderRadius.circular(10),
                   child: _isVideoOff
                       ? Container(
-                    color: Colors.grey.shade800,
-                    child: const Center(
-                      child: Icon(Icons.videocam_off, color: Colors.white, size: 40),
-                    ),
-                  )
-                      : RTCVideoView(_localRenderer, mirror: true),
+                          color: Colors.grey.shade800,
+                          child: const Center(
+                            child: Icon(Icons.videocam_off, color: Colors.white, size: 40),
+                          ),
+                        )
+                      : RTCVideoView(_localRenderer, mirror: true, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
                 ),
               ),
             ),
+
+            // Connection status indicator
+            if (_isConnected)
+              Positioned(
+                top: 20,
+                left: 20,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.green,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.circle, color: Colors.white, size: 8),
+                      SizedBox(width: 6),
+                      Text(
+                        'Connected',
+                        style: TextStyle(color: Colors.white, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
 
             // Controls (bottom)
             Positioned(
